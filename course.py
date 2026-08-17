@@ -59,6 +59,13 @@ MIN_RADIUS = 1.2  # tightest bend, in corridor half-widths: below this the infie
 MIN_LINE_NODES = 3  # a start line narrower than this is barely a choice
 MAX_LINE_NODES = 8  # wider than this and the line is running along the track, not across
 
+# Traced circuits (see spa.py) come in already shaped, so they are handled gently.
+TRACE_SMOOTHING = 1  # just enough to take the wobble out of a hand reading
+TRACE_WAYPOINTS = 400  # a longer, finer lap than the generated ones
+TRACE_MIN_SEPARATION = 2.02  # a real hairpin doubles back closer than a random shape may
+FIRST_GENERATED = 1  # variant 0 is Spa; the generator starts here
+GENERATED_MAPS = 40  # how far the rotation runs before wrapping back to Spa
+
 
 def _convex_hull(points):
     """Andrew's monotone chain. A simple loop to start growing the circuit from."""
@@ -248,16 +255,7 @@ def separation(points, half_width: float) -> float:
 
 
 def centerline(grid: Grid, variant: int = 0):
-    """Grow one circuit, sized so the finished track sits inside the grid.
-
-    Sizing the centreline is not enough to place the wall: the wall is offset
-    perpendicular to the curve, which around a bend reaches further than the
-    radius plus the corridor width suggests. So the shape is measured after it
-    has been fattened, then scaled and recentred until the actual wall clears
-    the grid edge by EDGE_MARGIN. A couple of passes is all it takes.
-    """
-    mid_x = (grid.cols - 1) / 2 * grid.spacing
-    mid_y = (grid.rows - 1) / 2 * grid.spacing
+    """Grow one circuit at random, sized to sit inside the grid."""
     width, height = grid.world_size
 
     rng = random.Random(variant * 7919 + 13)
@@ -281,8 +279,22 @@ def centerline(grid: Grid, variant: int = 0):
         points = _push_apart(points, SEPARATION_TARGET * HALF_WIDTH, rounds=6, skip=neighbourhood)
         points = _resample(_relax_curvature(points, MIN_RADIUS * HALF_WIDTH), WAYPOINTS)
 
+    return _fit_to_grid(grid, points, HALF_WIDTH)
+
+
+def _fit_to_grid(grid: Grid, points, half_width: float):
+    """Scale and centre a circuit so its wall clears the grid edge by EDGE_MARGIN.
+
+    Sizing the centreline is not enough to place the wall: the wall is offset
+    perpendicular to the curve, which around a bend reaches further than the
+    radius plus the corridor width suggests. So the shape is measured after it
+    has been fattened. A couple of passes is all it takes.
+    """
+    mid_x = (grid.cols - 1) / 2 * grid.spacing
+    mid_y = (grid.rows - 1) / 2 * grid.spacing
+    width, height = grid.world_size
     for _ in range(6):
-        outer, _ = loop_corridor(points, HALF_WIDTH)
+        outer, _ = loop_corridor(points, half_width)
         xs = [p[0] for p in outer]
         ys = [p[1] for p in outer]
         scale = min(
@@ -332,43 +344,38 @@ def _tangent(points, i: int) -> tuple[float, float]:
     return dx / length, dy / length
 
 
-def _pick_start_straight(grid: Grid, boundary: Boundary, points) -> tuple[Line, Line, int]:
-    """The start and finish lines, drawn across the same straight.
+def _pick_start_line(grid: Grid, boundary: Boundary, points, prefer: int = None) -> tuple[Line, int]:
+    """The start/finish line, drawn square across the track.
 
-    They belong together the way a real circuit's do — the finish a few cells
-    before the start, both square across the same stretch, so the pair reads as
-    one start/finish. That needs a length of track which is straight (the two
-    lines end up parallel rather than splayed around a bend) and running roughly
-    along an axis (an axis-aligned line cuts it squarely rather than running
-    away down the track). Every point on the lap is scored on those two counts
-    and the best is tried first.
+    One line, as a real circuit has: the car lines up on it and laps back to it.
+    It wants a stretch that is straight (so the line sits square to the track
+    rather than skewed across a bend) and running roughly along an axis (an
+    axis-aligned line cuts that squarely rather than running away down the
+    track). Every point on the lap is scored on those two counts and the best is
+    tried first.
+
+    A drawn or traced circuit knows where its start/finish belongs, so `prefer`
+    orders the candidates by nearness to that point instead, and the search
+    walks outwards from it until the geometry works.
     """
     count = len(points)
 
     def score(index: int) -> float:
-        behind = (index - LINE_SPACING) % count
-        ahead_dir, behind_dir = _tangent(points, index), _tangent(points, behind)
-        straightness = ahead_dir[0] * behind_dir[0] + ahead_dir[1] * behind_dir[1]
-        squareness = min(
-            max(abs(component) for component in normal_at(points, i)) for i in (index, behind)
-        )
+        here, ahead = _tangent(points, index), _tangent(points, (index + 3) % count)
+        straightness = here[0] * ahead[0] + here[1] * ahead[1]
+        squareness = max(abs(component) for component in normal_at(points, index))
         return straightness * squareness
 
-    for index in sorted(range(count), key=score, reverse=True):
-        behind = (index - LINE_SPACING) % count
-        lines = [_line_across(grid, boundary, points, i) for i in (index, behind)]
-        if not all(_usable_line(line) for line in lines):
-            continue
-        start_line, finish_line = lines
-        gap = min(
-            math.dist(grid.world_pos(*a), grid.world_pos(*b))
-            for a in start_line.nodes()
-            for b in finish_line.nodes()
-        )
-        if gap < MIN_LINE_GAP * grid.spacing:
-            continue  # nudged into each other by the walls
-        return start_line, finish_line, index
-    raise ValueError("no straight long enough to hold a start and finish line")
+    if prefer is None:
+        order = sorted(range(count), key=score, reverse=True)
+    else:
+        order = sorted(range(count), key=lambda i: min((i - prefer) % count, (prefer - i) % count))
+
+    for index in order:
+        line = _line_across(grid, boundary, points, index)
+        if _usable_line(line):
+            return line, index
+    raise ValueError("nowhere to put a start/finish line square across the track")
 
 
 def _usable_line(line: Line) -> bool:
@@ -386,69 +393,138 @@ def _nearest_open_node(grid: Grid, boundary: Boundary, point) -> tuple[int, int]
     raise ValueError(f"no drivable node near {point}")
 
 
-def _perpendicular_line(grid: Grid, points, index: int) -> Line:
+def _perpendicular_line(grid: Grid, points, index: int, half_width: float) -> Line:
     """A line at a true right angle to the track — for crossing tests only."""
     x, y = points[index]
     nx, ny = normal_at(points, index)
-    reach = HALF_WIDTH
     ends = [
-        (round((x + nx * reach * sign) / grid.spacing), round((y + ny * reach * sign) / grid.spacing))
+        (
+            round((x + nx * half_width * sign) / grid.spacing),
+            round((y + ny * half_width * sign) / grid.spacing),
+        )
         for sign in (1, -1)
     ]
     return Line(*ends)
 
 
-def build(grid: Grid = GRID, variant: int = 0) -> Track:
-    """Build one circuit. Raises ValueError if this variant is not usable."""
-    points = centerline(grid, variant)
+def assemble(
+    grid: Grid,
+    points,
+    half_width: float,
+    gates: int,
+    prefer_start: int = None,
+    label: str = "",
+    min_separation: float = MIN_SEPARATION,
+) -> Track:
+    """Turn a finished centreline into a Track: walls, line and gates.
 
-    # Two stretches running closer than the track is wide would merge into a
-    # blob of tarmac with no wall between them. Cheaper to catch here than to
-    # discover as a hole in the circuit.
-    if separation(points, HALF_WIDTH) < MIN_SEPARATION:
-        raise ValueError(f"variant {variant}: the circuit runs too close to itself")
+    Shared by the generated circuits and the drawn ones — everything from here
+    on cares only about the shape, not where it came from.
+    """
+    if separation(points, half_width) < min_separation:
+        raise ValueError(f"{label or 'circuit'}: the track runs too close to itself")
 
-    outer, infield = loop_corridor(points, HALF_WIDTH)
+    outer, infield = loop_corridor(points, half_width)
     # A tight enough bend folds the offset ring over itself; that is not a track.
     for name, ring in (("outer wall", outer), ("infield", infield)):
         if not is_simple(ring):
-            raise ValueError(f"variant {variant}: {name} crosses itself")
+            raise ValueError(f"{label or 'circuit'}: {name} crosses itself")
 
     width, height = grid.world_size
     edge = EDGE_MARGIN - 1.0  # a hair of slack for floating point
     if any(not (edge <= x <= width - edge and edge <= y <= height - edge) for x, y in outer):
-        raise ValueError(f"variant {variant}: the wall crowds the grid edge")
+        raise ValueError(f"{label or 'circuit'}: the wall crowds the grid edge")
 
     boundary = Boundary(outer=outer, holes=(infield,))
-    start_line, finish_line, start_at = _pick_start_straight(grid, boundary, points)
+    line, start_at = _pick_start_line(grid, boundary, points, prefer_start)
 
-    # Gates evenly spaced between the start and the finish, going the way the
-    # track runs, so clearing them in order means having driven the whole lap.
-    gates = tuple(
-        _perpendicular_line(grid, points, (start_at + round(WAYPOINTS * k / (CHECKPOINTS + 1))) % WAYPOINTS)
-        for k in range(1, CHECKPOINTS + 1)
+    # Gates evenly spaced round the lap from the start, going the way the track
+    # runs, so clearing them in order means having driven the whole thing. The
+    # last sits short of the line, so the lap ends by crossing it.
+    count = len(points)
+    checkpoints = tuple(
+        _perpendicular_line(grid, points, (start_at + round(count * k / (gates + 1))) % count, half_width)
+        for k in range(1, gates + 1)
     )
 
-    return Track(
-        grid=grid,
-        boundary=boundary,
-        start_line=start_line,
-        finish_line=finish_line,
-        checkpoints=gates,
+    return Track(grid=grid, boundary=boundary, line=line, checkpoints=checkpoints, name=label)
+
+
+def build_track(grid: Grid, normalised, half_width: float, gates: int, start_near, name: str) -> Track:
+    """A circuit drawn by hand, from points given in normalised (0..1) coordinates.
+
+    The drawing is already the shape, so it is only smoothed enough to take the
+    wobble out of a hand — none of the shaping the generator applies to its
+    random shapes, which would round off deliberate corners.
+
+    It is deliberately *not* rescaled to fill the grid. The grid is laid out to
+    match the ruling of the paper the circuit was drawn on, so a road two
+    squares wide comes out two squares wide; scaling the shape to fit would
+    quietly change how wide the track is relative to its own corners.
+    """
+    width, height = grid.world_size
+    points = [(x * width, y * height) for x, y in normalised]
+    points = _resample(_chaikin(points, TRACE_SMOOTHING), TRACE_WAYPOINTS)
+    # Points drawn by hand land unevenly, which leaves kinks far tighter than
+    # the corner they belong to. Relaxing only bends the corridor cannot survive
+    # takes those out and leaves the rest of the drawing alone.
+    points = _resample(_relax_curvature(points, MIN_RADIUS * half_width), TRACE_WAYPOINTS)
+
+    # Where the drawing says the start/finish belongs, as an index into the curve.
+    target = (start_near[0] * width, start_near[1] * height)
+    prefer = min(range(len(points)), key=lambda i: math.dist(points[i], target))
+    return assemble(
+        grid,
+        points,
+        half_width,
+        gates,
+        prefer_start=prefer,
+        label=name,
+        # A drawn hairpin runs back on itself far closer than a random shape is
+        # allowed to; is_simple still guarantees the walls never actually meet.
+        min_separation=TRACE_MIN_SEPARATION,
     )
 
 
-def build_next(grid: Grid = GRID, after: int = -1) -> tuple[Track, int]:
+def build(grid: Grid = GRID, variant: int = 0) -> Track:
+    """Build one circuit. Raises ValueError if this variant is not usable."""
+    points = centerline(grid, variant)
+    return assemble(grid, points, HALF_WIDTH, CHECKPOINTS, label=f"MAP {variant}")
+
+
+def rebuild(variant: int) -> Track:
+    """A fresh copy of one particular circuit, by variant number.
+
+    The solver runs on its own copy so its caches are never shared with the
+    thread doing the drawing.
+    """
+    import tracks  # here rather than at the top: tracks reads this module
+
+    saved = tracks.load_all()
+    if variant < len(saved):
+        return tracks.build(saved[variant])
+    return build(GRID, variant)
+
+
+def build_next(after: int = -1) -> tuple[Track, int]:
     """The next usable circuit after `after`, and its variant number.
 
-    Most random shapes tangle somewhere — a bend too tight for the corridor, two
-    stretches run together, no clean line across the track — so roughly two in
-    three are thrown away here rather than shown to the player. Pass after=-1
-    for the first usable circuit of all.
+    The circuits you drew come first, then the generated ones. Most random
+    shapes tangle somewhere — a bend too tight for the corridor, two stretches
+    run together, nowhere square to put a start line — so roughly two in three
+    are thrown away here rather than shown to the player. Pass after=-1 for the
+    first circuit of all, and the rotation wraps back round to it at the end.
     """
-    for variant in range(after + 1, after + 200):
+    import tracks  # here rather than at the top: tracks reads this module
+
+    saved = tracks.load_all()
+    last = len(saved) + GENERATED_MAPS
+    for step in range(1, last + 2):
+        variant = after + step
+        if variant >= last:
+            variant -= last  # wrap back round to the drawn circuits
         try:
-            return build(grid, variant), variant
+            return (tracks.build(saved[variant]) if variant < len(saved) else build(GRID, variant)), variant
         except ValueError:
             continue
     raise RuntimeError("no usable circuit found — the shape constraints are too tight")

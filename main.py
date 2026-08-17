@@ -1,9 +1,9 @@
-"""Drive the car by hand round the circuit: one lap, start line to finish line.
+"""Drive the car by hand round the circuit: one lap of the start/finish line.
 
-The track is a closed loop with an infield you have to go around. The finish
-line sits just behind the start line, so a lap only counts once the gates spread
-round the circuit have gone by in order — no reversing over the finish, and no
-running half way out and back.
+The track is a closed loop with an infield you have to go around. There is one
+line, start and finish both, so crossing it only ends the lap once the numbered
+gates round the circuit have gone by in order — setting off across it does not
+count, and neither does running half way out and back.
 
 The car keeps a velocity, so each turn it may only nudge that velocity by one
 step per axis — nine choices, drawn as rings. Leaving the tarmac is not one of
@@ -13,11 +13,11 @@ button appears.
 
 Run:   python main.py
 Mouse: left click one of the rings to take that move,
-       left click elsewhere on the start line to move where the car sets off,
-       right click a node on the finish line to pick the finish,
-       left drag to pan, wheel to zoom.
+       left click elsewhere on the start/finish line to move where the car
+       sets off, left drag to pan, wheel to zoom.
 Keys:  Backspace undoes a move, R restarts the run, M loads the next map,
-       P shows the optimal line as a ghost, V resets the view, Esc quits.
+       P shows the optimal line as a ghost, E opens the track editor,
+       V resets the view, Esc quits.
 """
 
 import math
@@ -26,6 +26,7 @@ import threading
 import pygame
 
 import course
+import editor
 import solver
 from car import Car
 from track import Track
@@ -54,9 +55,9 @@ SLOT_RADIUS = 4.5
 MARKER_RADIUS = 7.0
 GATE_LABEL_OFFSET = 14.0  # pixels past the end of a gate to sit its number
 
-# The two lines the car runs between, and the colour each is drawn in.
-LINES = (("start", START_COLOR), ("finish", FINISH_COLOR))
+LINE_MARK_COLOR = (235, 240, 250)  # the one start/finish line
 DRAG_SLOP = 4  # pixels of movement still counted as a click, not a pan
+SKETCH = "spa.png"  # what the editor traces over
 
 
 class View:
@@ -123,30 +124,55 @@ def draw_gate_number(surface, font, number: int, span, colour) -> None:
     surface.blit(glyph, box)
 
 
-def draw_track(surface, track: Track, view: View, font, hovered, gates_passed: int = 0) -> None:
-    """Tarmac, walls, the grid over the top, then the two lines."""
-    grid = track.grid
+_STATIC_LAYER: dict = {}  # (track, view) -> the drawn scenery, see static_layer()
 
-    outline = [view.to_screen(*p) for p in track.boundary.outer]
-    pygame.draw.polygon(surface, TARMAC, outline)
+
+def static_layer(track: Track, view: View, window) -> pygame.Surface:
+    """Tarmac, walls and the lattice, drawn once and kept.
+
+    Thousands of little circles is most of a frame's work and none of it changes
+    until the view moves, so it is painted onto its own surface and blitted
+    after that. Spa's grid is 5,280 nodes; without this the frame budget goes.
+    """
+    grid = track.grid
+    key = (id(track), round(view.zoom, 4), round(view.offset_x, 1), round(view.offset_y, 1))
+    layer = _STATIC_LAYER.get(key)
+    if layer is not None:
+        return layer
+
+    layer = pygame.Surface(window)
+    layer.fill(BACKGROUND)
+    pygame.draw.polygon(layer, TARMAC, [view.to_screen(*p) for p in track.boundary.outer])
     for hole in track.boundary.holes:
-        pygame.draw.polygon(surface, BACKGROUND, [view.to_screen(*p) for p in hole])
+        pygame.draw.polygon(layer, BACKGROUND, [view.to_screen(*p) for p in hole])
 
     for (c1, r1), (c2, r2) in grid.edges():
         # Only draw grid lines whose ends are both drivable, so the lattice
         # fades out at the walls instead of hiding the track shape.
         if track.is_open((c1, r1)) and track.is_open((c2, r2)):
-            pygame.draw.line(surface, LINE_COLOR, view.node_screen((c1, r1)), view.node_screen((c2, r2)), 1)
+            pygame.draw.line(layer, LINE_COLOR, view.node_screen((c1, r1)), view.node_screen((c2, r2)), 1)
 
     for ring in (track.boundary.outer, *track.boundary.holes):
-        pygame.draw.polygon(surface, WALL_COLOR, [view.to_screen(*p) for p in ring], width=2)
+        pygame.draw.polygon(layer, WALL_COLOR, [view.to_screen(*p) for p in ring], width=2)
 
     radius = max(1.2, NODE_RADIUS * view.zoom)
     for node in grid.nodes():
-        color = NODE_COLOR if track.is_open(node) else OFF_TRACK_COLOR
-        if node == hovered:
-            color = HOVER_COLOR
-        pygame.draw.circle(surface, color, view.node_screen(node), radius)
+        colour = NODE_COLOR if track.is_open(node) else OFF_TRACK_COLOR
+        pygame.draw.circle(layer, colour, view.node_screen(node), radius)
+
+    _STATIC_LAYER.clear()  # only the current view is ever wanted again
+    _STATIC_LAYER[key] = layer
+    return layer
+
+
+def draw_track(surface, track: Track, view: View, font, hovered, gates_passed: int = 0) -> None:
+    """Tarmac, walls, the grid over the top, then the two lines."""
+    surface.blit(static_layer(track, view, surface.get_size()), (0, 0))
+
+    if hovered is not None:
+        pygame.draw.circle(
+            surface, HOVER_COLOR, view.node_screen(hovered), max(1.2, NODE_RADIUS * view.zoom)
+        )
 
     for index, gate in enumerate(track.checkpoints):
         span = [view.to_screen(*p) for p in track.line_span(gate)]
@@ -155,29 +181,27 @@ def draw_track(surface, track: Track, view: View, font, hovered, gates_passed: i
         pygame.draw.line(surface, colour, *span, width=max(1, int(2 * view.zoom)))
         draw_gate_number(surface, font, index + 1, span, colour)
 
-    for which, color in LINES:
-        line = track.line_for(which)
-        # Drawn wall to wall rather than node to node, so it meets the tarmac edge.
-        span = [view.to_screen(*p) for p in track.line_span(line)]
-        pygame.draw.line(surface, color, *span, width=max(1, int(2 * view.zoom)))
-        # The slots have to out-read the line they sit on, or the line looks like
-        # one solid bar and every node under it looks selectable.
-        for node in track.line_nodes(which):
-            centre = view.node_screen(node)
-            radius = max(4.0, SLOT_RADIUS * view.zoom)
-            pygame.draw.circle(surface, BACKGROUND, centre, radius + 2)
-            pygame.draw.circle(surface, color, centre, radius)
+    # One line, start and finish both: the car lines up on it and laps back to it.
+    # Drawn wall to wall rather than node to node, so it meets the tarmac edge.
+    span = [view.to_screen(*p) for p in track.line_span(track.line)]
+    pygame.draw.line(surface, LINE_MARK_COLOR, *span, width=max(1, int(2 * view.zoom)))
+    # The slots have to out-read the line they sit on, or the line looks like one
+    # solid bar and every node under it looks selectable.
+    for node in track.line_nodes():
+        centre = view.node_screen(node)
+        radius = max(4.0, SLOT_RADIUS * view.zoom)
+        pygame.draw.circle(surface, BACKGROUND, centre, radius + 2)
+        pygame.draw.circle(surface, LINE_MARK_COLOR, centre, radius)
 
 
 def draw_markers(surface, track: Track, view: View, font) -> None:
-    """The chosen start and finish nodes, lettered so they read at a glance."""
-    for which, color in LINES:
-        pos = view.node_screen(getattr(track, which))
-        radius = max(5.0, MARKER_RADIUS * view.zoom)
-        pygame.draw.circle(surface, color, pos, radius)
-        pygame.draw.circle(surface, BACKGROUND, pos, radius, width=2)
-        glyph = font.render(which[0].upper(), True, BACKGROUND)
-        surface.blit(glyph, glyph.get_rect(center=pos))
+    """The slot the car lines up on, lettered so it reads at a glance."""
+    pos = view.node_screen(track.start)
+    radius = max(5.0, MARKER_RADIUS * view.zoom)
+    pygame.draw.circle(surface, START_COLOR, pos, radius)
+    pygame.draw.circle(surface, BACKGROUND, pos, radius, width=2)
+    glyph = font.render("S", True, BACKGROUND)
+    surface.blit(glyph, glyph.get_rect(center=pos))
 
 
 def draw_car(surface, car: Car, track: Track, view: View, options, hovered) -> None:
@@ -230,13 +254,13 @@ def draw_path(surface, solution, view: View) -> None:
     pygame.draw.circle(surface, PATH_COLOR, points[0], max(5.0, MARKER_RADIUS * view.zoom), width=2)
 
 
-def draw_map_button(surface, font, variant: int) -> pygame.Rect:
+def draw_map_button(surface, font, name: str) -> pygame.Rect:
     """Top-right button that swaps the circuit. Returns its rect."""
     button = pygame.Rect(surface.get_width() - 186, 8, 172, 32)
     hovered = button.collidepoint(pygame.mouse.get_pos())
     pygame.draw.rect(surface, TEXT_COLOR if hovered else BACKGROUND, button, border_radius=6)
     pygame.draw.rect(surface, TEXT_COLOR, button, width=1, border_radius=6)
-    label = font.render(f"MAP {variant}  >  (M)", True, BACKGROUND if hovered else TEXT_COLOR)
+    label = font.render(f"{name}  >  (M)", True, BACKGROUND if hovered else TEXT_COLOR)
     surface.blit(label, label.get_rect(center=button.center))
     return button
 
@@ -254,10 +278,21 @@ def draw_path_button(surface, font, showing: bool) -> pygame.Rect:
     return button
 
 
-def place(track: Track, which: str, node) -> None:
-    """Pick a node on a line, ignoring clicks that land off it or on the other marker."""
+def draw_draw_button(surface, font) -> pygame.Rect:
+    """Third button: opens the track editor."""
+    button = pygame.Rect(surface.get_width() - 186, 84, 172, 32)
+    hovered = button.collidepoint(pygame.mouse.get_pos())
+    pygame.draw.rect(surface, START_COLOR if hovered else BACKGROUND, button, border_radius=6)
+    pygame.draw.rect(surface, START_COLOR, button, width=1, border_radius=6)
+    label = font.render("DRAW A MAP  (E)", True, BACKGROUND if hovered else START_COLOR)
+    surface.blit(label, label.get_rect(center=button.center))
+    return button
+
+
+def place(track: Track, node) -> None:
+    """Move the car's grid slot, ignoring clicks that land off the line."""
     try:
-        track.choose(which, node)
+        track.choose(node)
     except ValueError:
         pass
 
@@ -270,8 +305,9 @@ def main() -> None:
     font = pygame.font.SysFont("consolas", 16)
     big_font = pygame.font.SysFont("consolas", 26, bold=True)
 
-    # Not every variant number yields a usable circuit, so ask for the first that does.
-    track, variant = course.build_next(course.GRID, after=-1)
+    # Variant 0 is Spa; the rest are generated, and not every number yields a
+    # usable one, so ask for the first that works.
+    track, variant = course.build_next(after=-1)
     grid = track.grid
     view = View(grid, WINDOW_SIZE)
     car = Car(track.start)
@@ -280,16 +316,33 @@ def main() -> None:
     restart_button = pygame.Rect(0, 0, 0, 0)
     map_button = pygame.Rect(0, 0, 0, 0)
     path_button = pygame.Rect(0, 0, 0, 0)
+    draw_button = pygame.Rect(0, 0, 0, 0)
+    drawing_board = None  # an editor.Editor while a circuit is being drawn
     show_path = False
     solutions: dict[int, solver.Solution | None] = {}  # None means no way round
     solving: set[int] = set()
     running = True
 
     def next_map() -> None:
-        nonlocal track, variant, show_path
-        track, variant = course.build_next(grid, after=variant)
+        nonlocal track, variant, show_path, grid, view
+        track, variant = course.build_next(after=variant)
+        # Circuits bring their own grid — Spa is portrait and finer than the
+        # generated ones — so the view has to be rebuilt around it.
+        if track.grid is not grid:
+            grid = track.grid
+            view = View(grid, WINDOW_SIZE)
         car.reset(track.start)
         # A new circuit means a new answer; show it only when it is asked for.
+        show_path = False
+
+    def adopt(drawn) -> None:
+        """Switch to a circuit that has just been drawn and saved."""
+        nonlocal track, variant, grid, view, show_path
+        track = drawn
+        # It was written to tracks/, so it is now first in the rotation.
+        variant = 0
+        grid, view = track.grid, View(track.grid, WINDOW_SIZE)
+        car.reset(track.start)
         show_path = False
 
     def request_solution(for_variant: int) -> None:
@@ -301,7 +354,7 @@ def main() -> None:
         def work() -> None:
             # Solve against its own copy of the track, so the search never shares
             # the caches the drawing thread is reading from.
-            solutions[for_variant] = solver.solve(course.build(grid, for_variant))
+            solutions[for_variant] = solver.solve(course.rebuild(for_variant))
             solving.discard(for_variant)
 
         threading.Thread(target=work, daemon=True).start()
@@ -313,11 +366,22 @@ def main() -> None:
         placing = len(car.history) == 1  # not away yet: still choosing a grid slot
         crashed = not options and not finished
         blocked = finished or crashed  # run over: only restarting gets you moving
-        on_start_line = hovered is not None and hovered in track.line_nodes("start")
+        on_start_line = hovered is not None and hovered in track.line_nodes()
 
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
+            elif drawing_board is not None:
+                # While the editor is up it owns the mouse and keyboard, bar the
+                # two keys that leave it.
+                if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+                    drawing_board = None
+                else:
+                    drawing_board.handle(event)
+                    if drawing_board.built is not None:
+                        adopt(drawing_board.built)
+                        drawing_board = None
+                continue
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_ESCAPE:
                     running = False
@@ -329,6 +393,8 @@ def main() -> None:
                     next_map()
                 elif event.key == pygame.K_p:
                     show_path = not show_path
+                elif event.key == pygame.K_e:
+                    drawing_board = editor.Editor(SKETCH, View, WINDOW_SIZE)
                 elif event.key == pygame.K_BACKSPACE:
                     car.undo()
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
@@ -342,24 +408,29 @@ def main() -> None:
                     next_map()
                 elif path_button.collidepoint(event.pos):
                     show_path = not show_path
+                elif draw_button.collidepoint(event.pos):
+                    drawing_board = editor.Editor(SKETCH, View, WINDOW_SIZE)
                 elif blocked and restart_button.collidepoint(event.pos):
                     car.reset(track.start)
-                # Before the first move the start line places the car; once the
-                # car is away, driving wins and only a slot it cannot reach
-                # anyway counts as asking to start again.
+                # Before the first move the line places the car; once the car is
+                # away, driving wins and only a slot it cannot reach anyway
+                # counts as asking to start again.
                 elif on_start_line and (placing or hovered not in options):
-                    place(track, "start", hovered)
+                    place(track, hovered)
                     car.reset(track.start)
                 elif hovered in options:
                     car.drive_to(hovered, track)
-            elif event.type == pygame.MOUSEBUTTONUP and event.button == 3:
-                if hovered:
-                    place(track, "finish", hovered)
             elif event.type == pygame.MOUSEMOTION and dragging:
                 drag_distance += abs(event.rel[0]) + abs(event.rel[1])
                 view.pan(*event.rel)
             elif event.type == pygame.MOUSEWHEEL:
                 view.zoom_at(*pygame.mouse.get_pos(), 1.1**event.y)
+
+        if drawing_board is not None:
+            drawing_board.draw(screen, font)
+            pygame.display.flip()
+            clock.tick(60)
+            continue
 
         keys = pygame.key.get_pressed()
         pan_speed = 400 * clock.get_time() / 1000
@@ -372,8 +443,7 @@ def main() -> None:
             request_solution(variant)
         solution = solutions.get(variant)
 
-        screen.fill(BACKGROUND)
-        draw_track(screen, track, view, font, hovered, gates_passed)
+        draw_track(screen, track, view, font, hovered, gates_passed)  # paints the background too
         if show_path and solution is not None:
             draw_path(screen, solution, view)  # under the car, so it never hides live state
         draw_markers(screen, track, view, font)
@@ -398,8 +468,9 @@ def main() -> None:
                 note, colour = f"best possible: {solution.turns} turns", PATH_COLOR
             screen.blit(font.render(note, True, colour), (14, 34))
 
-        map_button = draw_map_button(screen, font, variant)
+        map_button = draw_map_button(screen, font, track.name)
         path_button = draw_path_button(screen, font, show_path)
+        draw_button = draw_draw_button(screen, font)
 
         if crashed:
             restart_button = draw_banner(screen, font, big_font, "CRASHED", CRASH_COLOR)

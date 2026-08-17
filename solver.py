@@ -75,7 +75,7 @@ class _Distances:
             [node for node in gate.nodes() if track.is_open(node)] or list(gate.nodes())
             for gate in track.checkpoints
         ]
-        self.gates.append(track.line_nodes("finish"))  # the last leg ends at the finish
+        self.gates.append(track.line_nodes())  # the last leg ends back at the line
         # Distance from each gate to the one after it, summed backwards, so
         # `self.chain[i]` is the whole route left once gate i has been reached.
         self.chain = [0] * (len(self.gates) + 1)
@@ -110,7 +110,7 @@ def solve(track) -> Solution | None:
     best_cost: dict[State, int] = {}
     came_from: dict[State, State | None] = {}
 
-    for node in track.line_nodes("start"):
+    for node in track.line_nodes():
         state = (node, (0, 0), 0)
         best_cost[state] = 0
         came_from[state] = None

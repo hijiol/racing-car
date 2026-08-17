@@ -1,4 +1,4 @@
-"""The circuit: where the car may drive, and the lines it runs between.
+"""The circuit: where the car may drive, and the line it laps between.
 
 The track is ordinary polygon geometry in world coordinates and owes nothing to
 the grid — it curves wherever it likes and the grid nodes simply fall inside or
@@ -10,10 +10,10 @@ outside it. Two rules follow from that:
 That second rule matters because a fast car jumps several cells in one turn and
 could otherwise cut a corner straight through a wall.
 
-A Line is a run of grid nodes between two ends. The start and finish lines are
-kept horizontal or vertical by course.py, so every cell along them is a node the
-car can line up on; the checkpoint, which is only ever crossed, sits at a true
-right angle to the track instead.
+A Line is a run of grid nodes between two ends. The start/finish line — one line,
+as a real circuit has — is kept horizontal or vertical by course.py, so every cell
+along it is a node the car can line up on; the gates, which are only ever crossed,
+sit at a true right angle to the track instead.
 """
 
 import math
@@ -246,37 +246,31 @@ class Track:
 
     grid: Grid
     boundary: Boundary
-    start_line: Line
-    finish_line: Line
+    line: Line  # the start/finish line: one line, as a real circuit has
     checkpoints: tuple[Line, ...] = ()  # gates that must be crossed in order
+    name: str = ""  # what the map button calls it
     start: Node = field(default=None)
-    finish: Node = field(default=None)
 
     def __post_init__(self) -> None:
         self._open = {node for node in self.grid.nodes() if self.boundary.contains_point(self.grid.world_pos(*node))}
         self._allowed: dict[tuple[Node, Node], bool] = {}
         self._spans: dict[Line, tuple[Point, Point]] = {}
-        for which in ("start", "finish"):
-            options = self.line_nodes(which)
-            if not options:
-                raise ValueError(f"the {which} line has no nodes inside the track")
-            chosen = getattr(self, which)
-            self.choose(which, chosen if chosen in options else options[len(options) // 2])
+        slots = self.line_nodes()
+        if not slots:
+            raise ValueError("the start/finish line has no nodes inside the track")
+        self.choose(self.start if self.start in slots else slots[len(slots) // 2])
 
     def is_open(self, node: Node) -> bool:
         return node in self._open
 
-    def line_for(self, which: str) -> Line:
-        return self.start_line if which == "start" else self.finish_line
-
-    def line_nodes(self, which: str) -> list[Node]:
+    def line_nodes(self) -> list[Node]:
         """Every node on the line that is on the track — all of them selectable.
 
         No thinning: the car moves on the grid, so the places it can line up on
         are exactly the grid nodes the line passes through. Keeping the count
         sensible is the corridor's job, not the picker's.
         """
-        return [node for node in self.line_for(which).nodes() if self.is_open(node)]
+        return [node for node in self.line.nodes() if self.is_open(node)]
 
     def allows(self, origin: Node, destination: Node) -> bool:
         """May the car travel this straight hop? Both ends on track, no wall clipped.
@@ -326,8 +320,8 @@ class Track:
         return segments_cross(self.grid.world_pos(*origin), self.grid.world_pos(*destination), *span)
 
     def finished(self, origin: Node, destination: Node) -> bool:
-        """True if this single hop reaches the finish line."""
-        return self.hop_crosses(self.finish_line, origin, destination)
+        """True if this single hop crosses the start/finish line."""
+        return self.hop_crosses(self.line, origin, destination)
 
     def gates_passed(self, origin: Node, destination: Node, passed: int) -> int:
         """How many gates are behind the car after this hop.
@@ -342,11 +336,10 @@ class Track:
     def lap_progress(self, history: list[Node]) -> tuple[int, bool]:
         """Gates cleared so far, and whether the lap is done.
 
-        A single gate on the far side is not enough to prove a lap: with the
-        finish line sitting just behind the start, a car could run out to that
-        gate, turn round and come back to the finish having driven half the
-        circuit twice. Gates spread round the lap and counted in order can only
-        be cleared by going round the way the track runs.
+        The car starts on the start/finish line, so its very first move crosses
+        it. That is not a lap: the gates spread round the circuit have to go by
+        in order first, and gate one is still ahead. Only crossing the line with
+        every gate behind it counts, which is exactly how a real lap works.
         """
         passed = 0
         for origin, destination in zip(history, history[1:]):
@@ -355,11 +348,8 @@ class Track:
             passed = self.gates_passed(origin, destination, passed)
         return passed, False
 
-    def choose(self, which: str, node: Node) -> None:
-        """Pick where the car sets off from / aims for. Must be on that line."""
-        if node not in self.line_nodes(which):
-            raise ValueError(f"{node} is not a track node on the {which} line")
-        other = self.finish if which == "start" else self.start
-        if other is not None and node == other:
-            raise ValueError(f"start and finish cannot both be {node}")
-        setattr(self, which, node)
+    def choose(self, node: Node) -> None:
+        """Pick the slot on the line the car lines up on."""
+        if node not in self.line_nodes():
+            raise ValueError(f"{node} is not a track node on the start/finish line")
+        self.start = node
