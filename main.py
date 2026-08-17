@@ -1,8 +1,9 @@
 """Drive the car by hand round the circuit: one lap, start line to finish line.
 
-The track is a closed loop with an infield you have to go around. A lap only
-counts once the car has been past the checkpoint on the far side, so reversing
-over the finish line off the grid does not do it.
+The track is a closed loop with an infield you have to go around. The finish
+line sits just behind the start line, so a lap only counts once the gates spread
+round the circuit have gone by in order — no reversing over the finish, and no
+running half way out and back.
 
 The car keeps a velocity, so each turn it may only nudge that velocity by one
 step per axis — nine choices, drawn as rings. Leaving the tarmac is not one of
@@ -19,6 +20,7 @@ Keys:  Backspace undoes a move, R restarts the run, M loads the next map,
        P shows the optimal line as a ghost, V resets the view, Esc quits.
 """
 
+import math
 import threading
 
 import pygame
@@ -44,11 +46,13 @@ OPTION_COLOR = (120, 190, 255)
 TEXT_COLOR = (150, 160, 180)
 CRASH_COLOR = (240, 90, 110)
 CHECKPOINT_COLOR = (120, 130, 160)
+CHECKPOINT_DONE = (58, 64, 80)
 PATH_COLOR = (170, 140, 240)
 
 NODE_RADIUS = 2.5
 SLOT_RADIUS = 4.5
 MARKER_RADIUS = 7.0
+GATE_LABEL_OFFSET = 14.0  # pixels past the end of a gate to sit its number
 
 # The two lines the car runs between, and the colour each is drawn in.
 LINES = (("start", START_COLOR), ("finish", FINISH_COLOR))
@@ -103,7 +107,23 @@ def nearest_node(grid, view: View, mouse: tuple[int, int]):
     return col, row
 
 
-def draw_track(surface, track: Track, view: View, hovered) -> None:
+def draw_gate_number(surface, font, number: int, span, colour) -> None:
+    """Number a gate, just off the end of it.
+
+    Sat past the wall rather than on the tarmac: the numbers say which way round
+    to go, and the driving line is busy enough without digits under it.
+    """
+    (x1, y1), (x2, y2) = span
+    dx, dy = x1 - x2, y1 - y2
+    length = math.hypot(dx, dy) or 1.0
+    centre = (x1 + dx / length * GATE_LABEL_OFFSET, y1 + dy / length * GATE_LABEL_OFFSET)
+    glyph = font.render(str(number), True, colour)
+    box = glyph.get_rect(center=centre)
+    pygame.draw.circle(surface, BACKGROUND, centre, max(glyph.get_width(), glyph.get_height()) * 0.8)
+    surface.blit(glyph, box)
+
+
+def draw_track(surface, track: Track, view: View, font, hovered, gates_passed: int = 0) -> None:
     """Tarmac, walls, the grid over the top, then the two lines."""
     grid = track.grid
 
@@ -128,9 +148,12 @@ def draw_track(surface, track: Track, view: View, hovered) -> None:
             color = HOVER_COLOR
         pygame.draw.circle(surface, color, view.node_screen(node), radius)
 
-    if track.checkpoint is not None:
-        span = [view.to_screen(*p) for p in track.line_span(track.checkpoint)]
-        pygame.draw.line(surface, CHECKPOINT_COLOR, *span, width=max(1, int(2 * view.zoom)))
+    for index, gate in enumerate(track.checkpoints):
+        span = [view.to_screen(*p) for p in track.line_span(gate)]
+        # Gates already behind the car fade out, so the next one to aim for reads.
+        colour = CHECKPOINT_COLOR if index >= gates_passed else CHECKPOINT_DONE
+        pygame.draw.line(surface, colour, *span, width=max(1, int(2 * view.zoom)))
+        draw_gate_number(surface, font, index + 1, span, colour)
 
     for which, color in LINES:
         line = track.line_for(which)
@@ -285,8 +308,7 @@ def main() -> None:
 
     while running:
         hovered = nearest_node(grid, view, pygame.mouse.get_pos())
-        lap = track.lap_state(car.history)
-        finished = lap == "finished"
+        gates_passed, finished = track.lap_progress(car.history)
         options = {} if finished else car.moves(track)
         placing = len(car.history) == 1  # not away yet: still choosing a grid slot
         crashed = not options and not finished
@@ -351,7 +373,7 @@ def main() -> None:
         solution = solutions.get(variant)
 
         screen.fill(BACKGROUND)
-        draw_track(screen, track, view, hovered)
+        draw_track(screen, track, view, font, hovered, gates_passed)
         if show_path and solution is not None:
             draw_path(screen, solution, view)  # under the car, so it never hides live state
         draw_markers(screen, track, view, font)
@@ -363,7 +385,7 @@ def main() -> None:
             label = (
                 f"pos {car.pos}   velocity {car.velocity}   speed {car.speed:.1f}   "
                 f"turns {len(car.history) - 1}   moves {len(options)}   "
-                + ("checkpoint passed" if lap == "checkpoint" else "checkpoint ahead")
+                f"gates {gates_passed}/{len(track.checkpoints)}"
             )
         screen.blit(font.render(label, True, TEXT_COLOR), (14, 12))
 

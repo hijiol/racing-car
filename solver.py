@@ -1,10 +1,12 @@
 """Finding the fastest way round: fewest turns, any start slot.
 
-The search is over states of (position, velocity, checkpoint passed), because a
-node reached at different speeds has completely different futures — arriving at
-a hairpin flat out is not the same place as crawling into it. Every start-line
-slot is seeded at once and the goal is any hop that reaches the finish line, so
-the answer is the best run the map allows rather than the best from one slot.
+The search is over states of (position, velocity, gates passed), because a node
+reached at different speeds has completely different futures — arriving at a
+hairpin flat out is not the same place as crawling into it — and because a lap
+is only a lap if the gates round the circuit went by in order. Every start-line
+slot is seeded at once and the goal is any hop that reaches the finish line
+with every gate behind it, so the answer is the best run the map allows rather
+than the best from one slot.
 
 A plain breadth-first sweep gets the same answer but visits everything; A* with
 the heuristic below only walks towards the finish, which is the difference
@@ -18,7 +20,7 @@ from car import Car
 from grid import Node
 
 Velocity = tuple[int, int]
-State = tuple[Node, Velocity, bool]
+State = tuple[Node, Velocity, int]  # where, how fast, and how many gates behind it
 
 
 @dataclass
@@ -60,48 +62,43 @@ def chebyshev(a: Node, b: Node) -> int:
 
 
 class _Distances:
-    """Distances to the things the car must still reach. Cached per node."""
+    """How far the car still has to travel, gate by gate. Cached per node.
+
+    The route is forced: every remaining gate in order, then the finish line. So
+    the distance left is at least the hop to the next gate plus the chain of
+    gate-to-gate legs after it — a lower bound, which is what A* needs, and a
+    far tighter one than the straight line to the finish.
+    """
 
     def __init__(self, track):
-        # Track guarantees the finish line has on-track nodes; the checkpoint is
-        # only ever crossed, so fall back to its full span if none are on track.
-        self.finish_nodes = track.line_nodes("finish")
-        self.checkpoint_nodes = []
-        if track.checkpoint is not None:
-            on_track = [node for node in track.checkpoint.nodes() if track.is_open(node)]
-            self.checkpoint_nodes = on_track or list(track.checkpoint.nodes())
-        self._to_finish: dict[Node, int] = {}
-        self._to_checkpoint: dict[Node, int] = {}
-        # Both legs are mandatory, so the shortest way through the checkpoint is
-        # a lower bound on the distance left when it has not been passed yet.
-        self._checkpoint_to_finish = min(
-            (chebyshev(cp, fin) for cp in self.checkpoint_nodes for fin in self.finish_nodes),
-            default=0,
-        )
+        self.gates = [
+            [node for node in gate.nodes() if track.is_open(node)] or list(gate.nodes())
+            for gate in track.checkpoints
+        ]
+        self.gates.append(track.line_nodes("finish"))  # the last leg ends at the finish
+        # Distance from each gate to the one after it, summed backwards, so
+        # `self.chain[i]` is the whole route left once gate i has been reached.
+        self.chain = [0] * (len(self.gates) + 1)
+        for i in range(len(self.gates) - 2, -1, -1):
+            leg = min(chebyshev(a, b) for a in self.gates[i] for b in self.gates[i + 1])
+            self.chain[i] = leg + self.chain[i + 1]
+        self._to_gate: list[dict[Node, int]] = [{} for _ in self.gates]
 
-    def to_finish(self, node: Node) -> int:
-        value = self._to_finish.get(node)
+    def remaining(self, node: Node, gate_index: int) -> int:
+        cached = self._to_gate[gate_index]
+        value = cached.get(node)
         if value is None:
-            value = min(chebyshev(node, target) for target in self.finish_nodes)
-            self._to_finish[node] = value
-        return value
-
-    def remaining(self, node: Node, checkpoint_passed: bool) -> int:
-        if checkpoint_passed or not self.checkpoint_nodes:
-            return self.to_finish(node)
-        value = self._to_checkpoint.get(node)
-        if value is None:
-            value = min(chebyshev(node, target) for target in self.checkpoint_nodes)
-            self._to_checkpoint[node] = value
-        return value + self._checkpoint_to_finish
+            value = min(chebyshev(node, target) for target in self.gates[gate_index])
+            cached[node] = value
+        return value + self.chain[gate_index]
 
 
 def solve(track) -> Solution | None:
     """The fewest-turn run from any start slot. None if the map cannot be won."""
     distances = _Distances(track)
-    checkpoint = track.checkpoint
+    gate_count = len(track.checkpoints)
 
-    def heuristic(node: Node, velocity: Velocity, passed: bool) -> int:
+    def heuristic(node: Node, velocity: Velocity, passed: int) -> int:
         distance = distances.remaining(node, passed)
         if distance == 0:
             return 0
@@ -114,10 +111,10 @@ def solve(track) -> Solution | None:
     came_from: dict[State, State | None] = {}
 
     for node in track.line_nodes("start"):
-        state = (node, (0, 0), False)
+        state = (node, (0, 0), 0)
         best_cost[state] = 0
         came_from[state] = None
-        heapq.heappush(queue, (heuristic(node, (0, 0), False), 0, state))
+        heapq.heappush(queue, (heuristic(node, (0, 0), 0), 0, state))
 
     while queue:
         _, cost, state = heapq.heappop(queue)
@@ -126,14 +123,12 @@ def solve(track) -> Solution | None:
 
         node, velocity, passed = state
         for destination, next_velocity in Car(node, velocity).moves(track).items():
-            next_passed = passed or (
-                checkpoint is not None and track.hop_crosses(checkpoint, node, destination)
-            )
-            if passed and track.finished(node, destination):
-                final = (destination, next_velocity, True)
+            if passed == gate_count and track.finished(node, destination):
+                final = (destination, next_velocity, passed)
                 came_from[final] = state
                 return _reconstruct(final, came_from)
 
+            next_passed = track.gates_passed(node, destination, passed)
             next_state = (destination, next_velocity, next_passed)
             next_cost = cost + 1
             if next_cost < best_cost.get(next_state, float("inf")):

@@ -36,19 +36,26 @@ GRID = Grid(cols=79, rows=55, spacing=13.0)
 HALF_WIDTH = 2.1 * GRID.spacing  # corridor half-width
 EDGE_MARGIN = 55.0  # clear grid left showing outside the wall, on every side
 WAYPOINTS = 260
-CHECKPOINT_AT = 0.5  # the far side of the circuit
+# Gates spread round the lap, crossed in order. One gate on the far side would
+# let the car run out to it, turn round and come back to the finish having never
+# gone round at all; several in sequence can only be cleared by driving the lap.
+CHECKPOINTS = 6
 LINE_SPACING = 6  # centreline points between the finish line and the start line
 MIN_LINE_GAP = 2.5  # clear cells between the two lines, so they never merge
 
-SEED_POINTS = 14  # scattered points the hull is taken from
-# Two rounds of displacement, the second gentler: one round gives a rounded blob,
-# two give a lap with real corners on it. A third tangles more shapes than it is
-# worth, since every bad shape is a rejection.
-DISPLACEMENTS = (0.40, 0.30)
+SEED_POINTS = 12  # scattered points the hull is taken from
+# Each round of displacement folds more corners into the lap: one gives a rounded
+# blob, two a decent circuit, three something that genuinely winds. Three only
+# pays off alongside the repair passes below, which rescue the shapes it mangles.
+DISPLACEMENTS = (0.45, 0.40, 0.35)
+MIN_FEATURE = 4.5  # shortest edge worth bending, in corridor half-widths
 SMOOTHING = 3  # Chaikin rounds; more means gentler bends
-MIN_GAP = 2.8  # closest two parts of the circuit may come, in corridor half-widths
+REPAIR_PASSES = 3  # rounds of separating and re-opening the finished curve
+MIN_GAP = 2.4  # closest two parts of the circuit may come, in corridor half-widths
+SEPARATION_TARGET = 2.6  # what the repair passes aim for, above the minimum
+MIN_SEPARATION = 2.15  # below this the two walls touch and the track leaks
 MIN_CORNER = math.radians(72)  # sharpest corner allowed before smoothing rounds it
-MIN_RADIUS = 1.3  # tightest bend, in corridor half-widths: below this the infield folds
+MIN_RADIUS = 1.2  # tightest bend, in corridor half-widths: below this the infield folds
 MIN_LINE_NODES = 3  # a start line narrower than this is barely a choice
 MAX_LINE_NODES = 8  # wider than this and the line is running along the track, not across
 
@@ -71,13 +78,20 @@ def _convex_hull(points):
 
 
 def _displace_midpoints(points, rng, magnitude: float):
-    """Insert a midpoint on every edge, pushed sideways. This is where bends come from."""
+    """Insert a midpoint on every edge, pushed sideways. This is where bends come from.
+
+    Edges already shorter than a few track widths are subdivided but left where
+    they are. Bending those too would ripple the wall at a scale the car cannot
+    even steer around, which reads as a wobbly edge rather than as a corner.
+    """
     grown = []
     for i, point in enumerate(points):
         nxt = points[(i + 1) % len(points)]
         dx, dy = nxt[0] - point[0], nxt[1] - point[1]
         length = math.hypot(dx, dy) or 1.0
         offset = rng.uniform(-magnitude, magnitude) * length
+        if length < MIN_FEATURE * HALF_WIDTH:
+            offset = 0.0
         grown.append(point)
         grown.append(
             (
@@ -88,19 +102,22 @@ def _displace_midpoints(points, rng, magnitude: float):
     return grown
 
 
-def _push_apart(points, min_distance: float, rounds: int = 12):
-    """Separate points that stray within a track's width of each other.
+def _push_apart(points, min_distance: float, rounds: int = 12, skip: int = 2):
+    """Separate stretches of circuit that stray within a track's width of each other.
 
-    Two stretches of circuit running closer than the corridor is wide would
-    merge into one lump of tarmac when fattened, so they are eased apart first.
+    Two stretches running closer than the corridor is wide would merge into one
+    lump of tarmac when fattened, so they are eased apart first. `skip` is how
+    many points along the curve count as neighbours and are left alone — on a
+    finely resampled curve that has to be a good fraction of a bend, or the
+    curve simply pushes itself straight.
     """
     points = [list(p) for p in points]
     count = len(points)
     for _ in range(rounds):
         moved = False
         for i in range(count):
-            for j in range(i + 2, count):
-                if i == 0 and j == count - 1:
+            for j in range(i + skip, count):
+                if count - (j - i) < skip:
                     continue  # neighbours around the loop
                 dx = points[j][0] - points[i][0]
                 dy = points[j][1] - points[i][1]
@@ -253,7 +270,16 @@ def centerline(grid: Grid, variant: int = 0):
         points = _push_apart(points, MIN_GAP * HALF_WIDTH)
         points = _open_corners(points, MIN_CORNER)
     points = _resample(_chaikin(points, SMOOTHING), WAYPOINTS)
-    points = _resample(_relax_curvature(points, MIN_RADIUS * HALF_WIDTH), WAYPOINTS)
+
+    # Smoothing pulls bends in and can leave two stretches brushing past each
+    # other, which would otherwise mean throwing the whole shape away. Repairing
+    # the finished curve instead — separate, then re-open the bends that the
+    # separating tightened — keeps most of them, and the ones it keeps are the
+    # twistier shapes worth having.
+    neighbourhood = WAYPOINTS // 12
+    for _ in range(REPAIR_PASSES):
+        points = _push_apart(points, SEPARATION_TARGET * HALF_WIDTH, rounds=6, skip=neighbourhood)
+        points = _resample(_relax_curvature(points, MIN_RADIUS * HALF_WIDTH), WAYPOINTS)
 
     for _ in range(6):
         outer, _ = loop_corridor(points, HALF_WIDTH)
@@ -379,7 +405,7 @@ def build(grid: Grid = GRID, variant: int = 0) -> Track:
     # Two stretches running closer than the track is wide would merge into a
     # blob of tarmac with no wall between them. Cheaper to catch here than to
     # discover as a hole in the circuit.
-    if separation(points, HALF_WIDTH) < 2.4:
+    if separation(points, HALF_WIDTH) < MIN_SEPARATION:
         raise ValueError(f"variant {variant}: the circuit runs too close to itself")
 
     outer, infield = loop_corridor(points, HALF_WIDTH)
@@ -396,14 +422,19 @@ def build(grid: Grid = GRID, variant: int = 0) -> Track:
     boundary = Boundary(outer=outer, holes=(infield,))
     start_line, finish_line, start_at = _pick_start_straight(grid, boundary, points)
 
+    # Gates evenly spaced between the start and the finish, going the way the
+    # track runs, so clearing them in order means having driven the whole lap.
+    gates = tuple(
+        _perpendicular_line(grid, points, (start_at + round(WAYPOINTS * k / (CHECKPOINTS + 1))) % WAYPOINTS)
+        for k in range(1, CHECKPOINTS + 1)
+    )
+
     return Track(
         grid=grid,
         boundary=boundary,
         start_line=start_line,
         finish_line=finish_line,
-        # Half a lap on, so the only way to reach the finish is the long way
-        # round — a car that reversed over the line has not passed it.
-        checkpoint=_perpendicular_line(grid, points, (start_at + int(WAYPOINTS * CHECKPOINT_AT)) % WAYPOINTS),
+        checkpoints=gates,
     )
 
 

@@ -248,7 +248,7 @@ class Track:
     boundary: Boundary
     start_line: Line
     finish_line: Line
-    checkpoint: Line = field(default=None)
+    checkpoints: tuple[Line, ...] = ()  # gates that must be crossed in order
     start: Node = field(default=None)
     finish: Node = field(default=None)
 
@@ -329,22 +329,31 @@ class Track:
         """True if this single hop reaches the finish line."""
         return self.hop_crosses(self.finish_line, origin, destination)
 
-    def lap_state(self, history: list[Node]) -> str:
-        """How far round the run has got: "running", "checkpoint" or "finished".
+    def gates_passed(self, origin: Node, destination: Node, passed: int) -> int:
+        """How many gates are behind the car after this hop.
 
-        On a loop the finish line sits just short of the start line, so a car
-        that simply reversed off the grid would trip it on turn one. The
-        checkpoint on the far side of the circuit is what makes the lap real:
-        the finish only counts once the car has been round past it.
+        Gates only count in order, and a single fast hop can clear more than one
+        where they are close together, so this keeps advancing while it can.
         """
-        reached_checkpoint = self.checkpoint is None
+        while passed < len(self.checkpoints) and self.hop_crosses(self.checkpoints[passed], origin, destination):
+            passed += 1
+        return passed
+
+    def lap_progress(self, history: list[Node]) -> tuple[int, bool]:
+        """Gates cleared so far, and whether the lap is done.
+
+        A single gate on the far side is not enough to prove a lap: with the
+        finish line sitting just behind the start, a car could run out to that
+        gate, turn round and come back to the finish having driven half the
+        circuit twice. Gates spread round the lap and counted in order can only
+        be cleared by going round the way the track runs.
+        """
+        passed = 0
         for origin, destination in zip(history, history[1:]):
-            if not reached_checkpoint:
-                if self.hop_crosses(self.checkpoint, origin, destination):
-                    reached_checkpoint = True
-            elif self.finished(origin, destination):
-                return "finished"
-        return "checkpoint" if reached_checkpoint and self.checkpoint is not None else "running"
+            if passed == len(self.checkpoints) and self.finished(origin, destination):
+                return passed, True
+            passed = self.gates_passed(origin, destination, passed)
+        return passed, False
 
     def choose(self, which: str, node: Node) -> None:
         """Pick where the car sets off from / aims for. Must be on that line."""
