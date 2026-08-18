@@ -1,73 +1,81 @@
-"""Circuits you drew yourself, kept on disk.
+"""Circuits read off a drawing, kept on disk.
 
-Each one is a JSON file in tracks/: the centreline in normalised (0..1)
-coordinates, the grid it was drawn on, how wide the road is and where the
-start/finish belongs. Normalised and grid-stamped so a track rebuilds exactly
-the same on any run, whatever the window is doing.
+Each one is a JSON file in tracks/: the two walls as polygons, a centreline for
+placing gates, and the grid they were measured onto — all in normalised (0..1)
+coordinates. The scan itself is not needed again, so a saved circuit loads
+without OpenCV and stays exactly the same forever.
 
-The grid is laid out to match the ruling of graph paper — two nodes per square —
-so a road drawn two squares wide comes out five nodes across, and the lattice
-lines up with the paper underneath.
+The grid is taken from the paper's own ruling. `NODES_PER_SQUARE` nodes to a
+square puts the lattice on the lines the circuit was drawn over.
 """
 
 import json
-import math
 import pathlib
 
 from grid import Grid
 
 FOLDER = pathlib.Path(__file__).parent / "tracks"
 
-# The sketch is on 5mm A4 graph paper, whose squares came out 12 pixels across in
-# the photo. Two grid cells to a square puts a node on every ruled line and one
-# between, which is what makes a two-square road exactly five nodes wide.
-CELLS_PER_SQUARE = 2
-ROAD_SQUARES = 2.0  # how many paper squares wide the road is
-HALF_WIDTH_CELLS = ROAD_SQUARES * CELLS_PER_SQUARE / 2
+# One node per graph-paper square: the game's lattice *is* the paper's ruling, so
+# the four corners of a square on the drawing are four nodes in the game.
+NODES_PER_SQUARE = 1
 GATES = 8
-
-# Grid left clear around the sheet. A drawing that runs to the edge of the paper
-# still needs somewhere to put its outer wall, and the builder wants clear grid
-# beyond that again — without this margin, tracing right to the paper's edge is
-# refused for crowding the grid.
-MARGIN_CELLS = 10
+MARGIN_CELLS = 6  # clear grid around the drawing, so the walls are never at the very edge
 
 
-def canvas_grid(aspect: float, squares_tall: int = 57, spacing: float = 7.0) -> Grid:
-    """A grid ruled like the paper: `squares_tall` squares down, `aspect` wide.
+def grid_for(scan_size, ruling) -> Grid:
+    """A grid ruled like the paper the circuit was drawn on."""
+    cell = ruling.pitch / NODES_PER_SQUARE
+    width, height = scan_size
+    return Grid(
+        cols=round(width / cell) + 1 + 2 * MARGIN_CELLS,
+        rows=round(height * ruling.y_scale / cell) + 1 + 2 * MARGIN_CELLS,
+        spacing=cell,
+    )
 
-    Two nodes to a square, with a margin of clear grid all round the sheet.
+
+def placement(ruling, grid: Grid) -> tuple[float, float, float]:
+    """Where to put the drawing in the world: (x, y, y_scale).
+
+    Chosen so the paper's ruled lines fall on nodes. The margin sets roughly
+    where the sheet sits; the fractional part is then nudged by the ruling's own
+    offset, so that the first ruled line — and every one after it — lands on the
+    lattice instead of a fraction of a cell away from it.
     """
-    rows = squares_tall * CELLS_PER_SQUARE + 1 + 2 * MARGIN_CELLS
-    cols = round(squares_tall * aspect) * CELLS_PER_SQUARE + 1 + 2 * MARGIN_CELLS
-    return Grid(cols=cols, rows=rows, spacing=spacing)
+    cell = grid.spacing
+    rough = MARGIN_CELLS * cell
+    return rough - (ruling.phase_x % cell), rough - (ruling.phase_y % cell), ruling.y_scale
 
 
-def paper_rect(grid: Grid) -> tuple[float, float, float, float]:
-    """Where the sheet sits in the grid's world: (x, y, width, height)."""
-    inset = MARGIN_CELLS * grid.spacing
-    width, height = grid.world_size
-    return inset, inset, width - 2 * inset, height - 2 * inset
+def to_world(point, place) -> tuple[float, float]:
+    """Scan pixels -> world units, squared up and sat on the ruling."""
+    offset_x, offset_y, y_scale = place
+    return point[0] + offset_x, point[1] * y_scale + offset_y
 
 
-def half_width(grid: Grid) -> float:
-    return HALF_WIDTH_CELLS * grid.spacing
-
-
-def save(name: str, points, start_near, grid: Grid) -> pathlib.Path:
-    """Write a drawn circuit to tracks/<name>.json and return the path."""
+def save(name: str, drawing, grid: Grid, place, sketch: str = "") -> pathlib.Path:
+    """Write a circuit read off a scan to tracks/<name>.json."""
     FOLDER.mkdir(exist_ok=True)
+    width, height = grid.world_size
+
+    def norm(points):
+        return [[round(x / width, 6), round(y / height, 6)] for x, y in (to_world(p, place) for p in points)]
+
     path = FOLDER / f"{_slug(name)}.json"
     path.write_text(
         json.dumps(
             {
                 "name": name,
-                "points": [[round(x, 5), round(y, 5)] for x, y in points],
-                "start_near": [round(start_near[0], 5), round(start_near[1], 5)],
-                "grid": {"cols": grid.cols, "rows": grid.rows, "spacing": grid.spacing},
+                "sketch": sketch,
+                "outer": norm(drawing.outer),
+                "inners": [norm(inner) for inner in drawing.inners],
+                "centre": norm(drawing.centre),
+                "start_at": drawing.start_at,
+                "road_width": round(drawing.road_width, 2),
+                "grid": {"cols": grid.cols, "rows": grid.rows, "spacing": round(grid.spacing, 4)},
+                "place": [round(v, 4) for v in place],
                 "gates": GATES,
-            },
-            indent=1,
+            }
         ),
         encoding="utf-8",
     )
@@ -75,40 +83,46 @@ def save(name: str, points, start_near, grid: Grid) -> pathlib.Path:
 
 
 def load_all() -> list[dict]:
-    """Every saved circuit, oldest first. Unreadable files are skipped, not fatal."""
+    """Every saved circuit, by name. A half-written file is skipped, not fatal."""
     if not FOLDER.is_dir():
         return []
     saved = []
     for path in sorted(FOLDER.glob("*.json")):
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
-            if len(data.get("points", [])) >= 8:
+            if len(data.get("outer", [])) >= 8:
                 saved.append(data)
         except (json.JSONDecodeError, OSError):
-            continue  # a half-written file should not stop the game starting
+            continue
     return saved
 
 
 def build(data: dict):
     """Rebuild a saved circuit into a Track."""
     import course  # here rather than at the top: course reads this module
+    from track import Boundary
 
     grid = Grid(**data["grid"])
-    return course.build_track(
+    width, height = grid.world_size
+
+    def world(points):
+        return tuple((x * width, y * height) for x, y in points)
+
+    boundary = Boundary(outer=world(data["outer"]), holes=tuple(world(i) for i in data["inners"]))
+    centre = list(world(data["centre"]))
+    return course.from_walls(
         grid,
-        data["points"],
-        half_width=half_width(grid),
+        boundary,
+        centre,
+        half_width=data["road_width"] / 2,
         gates=data.get("gates", GATES),
-        start_near=data["start_near"],
-        name=data["name"],
+        prefer_start=data.get("start_at", 0),
+        label=data["name"],
+        sketch=data.get("sketch", ""),
+        # Where the drawing sits in the world, so it can be laid back over the top.
+        sketch_place=tuple(data.get("place", (0.0, 0.0, 1.0))),
     )
 
 
 def _slug(name: str) -> str:
-    keep = [c.lower() if c.isalnum() else "-" for c in name.strip()]
-    return "".join(keep).strip("-") or "track"
-
-
-def closest_index(points, target) -> int:
-    """Index of the point nearest `target` — used to place the start/finish."""
-    return min(range(len(points)), key=lambda i: math.dist(points[i], target))
+    return "".join(c.lower() if c.isalnum() else "-" for c in name.strip()).strip("-") or "track"

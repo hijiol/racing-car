@@ -320,7 +320,7 @@ def _line_across(grid: Grid, boundary: Boundary, points, index: int) -> Line:
     axis-aligned means every cell along it is a node the car can be placed on.
     """
     x, y = points[index]
-    nx, ny = normal_at(points, index)
+    nx, ny = _square_across(points, index)
     step = (1, 0) if abs(nx) > abs(ny) else (0, 1)
 
     middle = _nearest_open_node(grid, boundary, (x, y))
@@ -336,12 +336,28 @@ def _line_across(grid: Grid, boundary: Boundary, points, index: int) -> Line:
     return Line(*ends)
 
 
-def _tangent(points, i: int) -> tuple[float, float]:
-    """Unit vector along the track at point i."""
-    before, after = points[(i - 1) % len(points)], points[(i + 1) % len(points)]
+LINE_STENCIL = 4  # centreline points either side used to read the track's direction
+
+
+def _tangent(points, i: int, span: int = LINE_STENCIL) -> tuple[float, float]:
+    """Unit vector along the track at point i.
+
+    Read over several points rather than one either side. A start/finish line
+    drawn across the road leaves a gap in the centreline exactly where the line
+    belongs, and across a gap that short the nearest neighbours say more about
+    the width of the road than the direction of it — which lands the line along
+    the track instead of across it.
+    """
+    before, after = points[(i - span) % len(points)], points[(i + span) % len(points)]
     dx, dy = after[0] - before[0], after[1] - before[1]
     length = math.hypot(dx, dy) or 1.0
     return dx / length, dy / length
+
+
+def _square_across(points, i: int) -> tuple[float, float]:
+    """Unit vector square across the track at point i."""
+    dx, dy = _tangent(points, i)
+    return -dy, dx
 
 
 def _pick_start_line(grid: Grid, boundary: Boundary, points, prefer: int = None) -> tuple[Line, int]:
@@ -363,7 +379,7 @@ def _pick_start_line(grid: Grid, boundary: Boundary, points, prefer: int = None)
     def score(index: int) -> float:
         here, ahead = _tangent(points, index), _tangent(points, (index + 3) % count)
         straightness = here[0] * ahead[0] + here[1] * ahead[1]
-        squareness = max(abs(component) for component in normal_at(points, index))
+        squareness = max(abs(component) for component in _square_across(points, index))
         return straightness * squareness
 
     if prefer is None:
@@ -436,18 +452,45 @@ def assemble(
         raise ValueError(f"{label or 'circuit'}: the wall crowds the grid edge")
 
     boundary = Boundary(outer=outer, holes=(infield,))
-    line, start_at = _pick_start_line(grid, boundary, points, prefer_start)
+    return from_walls(grid, boundary, points, half_width, gates, prefer_start, label)
+
+
+def from_walls(
+    grid: Grid,
+    boundary: Boundary,
+    centre,
+    half_width: float,
+    gates: int,
+    prefer_start: int = None,
+    label: str = "",
+    sketch: str = "",
+    sketch_place: tuple = (),
+) -> Track:
+    """A Track from walls that already exist, plus a centreline to place things on.
+
+    Used both by the generated circuits, whose walls come from fattening a
+    centreline, and by a circuit read off a drawing, whose walls are the pen
+    lines themselves. Everything past this point only cares about the shape.
+    """
+    line, start_at = _pick_start_line(grid, boundary, centre, prefer_start)
 
     # Gates evenly spaced round the lap from the start, going the way the track
     # runs, so clearing them in order means having driven the whole thing. The
     # last sits short of the line, so the lap ends by crossing it.
-    count = len(points)
+    count = len(centre)
     checkpoints = tuple(
-        _perpendicular_line(grid, points, (start_at + round(count * k / (gates + 1))) % count, half_width)
+        _perpendicular_line(grid, centre, (start_at + round(count * k / (gates + 1))) % count, half_width)
         for k in range(1, gates + 1)
     )
-
-    return Track(grid=grid, boundary=boundary, line=line, checkpoints=checkpoints, name=label)
+    return Track(
+        grid=grid,
+        boundary=boundary,
+        line=line,
+        checkpoints=checkpoints,
+        name=label,
+        sketch=sketch,
+        sketch_place=sketch_place,
+    )
 
 
 def build_track(grid: Grid, normalised, half_width: float, gates: int, start_near, name: str) -> Track:

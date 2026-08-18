@@ -16,18 +16,22 @@ Mouse: left click one of the rings to take that move,
        left click elsewhere on the start/finish line to move where the car
        sets off, left drag to pan, wheel to zoom.
 Keys:  Backspace undoes a move, R restarts the run, M loads the next map,
-       P shows the optimal line as a ghost, E opens the track editor,
-       V resets the view, Esc quits.
+       P shows the optimal line as a ghost, E reads the circuit off spa.png,
+       O lays that drawing back over the track to check it, V resets the view,
+       Esc quits.
 """
 
 import math
 import threading
 
+import numpy
+
 import pygame
 
 import course
-import editor
+import detect
 import solver
+import tracks
 from car import Car
 from track import Track
 
@@ -57,7 +61,7 @@ GATE_LABEL_OFFSET = 14.0  # pixels past the end of a gate to sit its number
 
 LINE_MARK_COLOR = (235, 240, 250)  # the one start/finish line
 DRAG_SLOP = 4  # pixels of movement still counted as a click, not a pan
-SKETCH = "spa.png"  # what the editor traces over
+SKETCH = "spa.png"  # the scanned drawing the circuit is read from
 
 
 class View:
@@ -124,6 +128,48 @@ def draw_gate_number(surface, font, number: int, span, colour) -> None:
     surface.blit(glyph, box)
 
 
+_SKETCH_LAYER: dict = {}  # (drawing, zoom) -> the drawing scaled to the view
+SKETCH_FADES = (0.0, 0.55, 1.0)  # what O cycles the overlay through
+SKETCH_INK = (120, 210, 255)  # the drawing's pen, laid back over the track
+
+
+def draw_sketch(surface, track: Track, view: View, fade: float) -> bool:
+    """Lay the original drawing back over the track, to see how well it was read.
+
+    A circuit read from a scan sits one world unit to the pixel, offset by the
+    clear margin around it, so the drawing drops straight back on top of the
+    track it produced — anywhere the walls have wandered off the ink shows up
+    immediately. Returns False if this circuit did not come from a drawing.
+    """
+    if not track.sketch or fade <= 0:
+        return bool(track.sketch)
+    key = (track.sketch, round(view.zoom, 3), fade, track.sketch_place)
+    scaled = _SKETCH_LAYER.get(key)
+    if scaled is None:
+        try:
+            image = pygame.image.load(track.sketch)
+        except (pygame.error, FileNotFoundError):
+            return False
+        # Only the pen is wanted, glowing over the dark track. Blending the scan
+        # as it is would lay a sheet of white paper over everything; inverting it
+        # first means bare paper adds nothing and the ink lights up.
+        pixels = pygame.surfarray.array3d(image).mean(axis=2)
+        ink = (255 - pixels) * fade
+        tinted = numpy.dstack([ink * (c / 255) for c in SKETCH_INK]).astype(numpy.uint8)
+        drawn = pygame.surfarray.make_surface(tinted)
+        _, _, y_scale = track.sketch_place or (0, 0, 1.0)
+        size = (
+            max(1, int(image.get_width() * view.zoom)),
+            max(1, int(image.get_height() * y_scale * view.zoom)),
+        )
+        scaled = pygame.transform.smoothscale(drawn, size)
+        _SKETCH_LAYER.clear()  # only the current zoom is ever wanted again
+        _SKETCH_LAYER[key] = scaled
+    offset_x, offset_y, _ = track.sketch_place or (0, 0, 1.0)
+    surface.blit(scaled, view.to_screen(offset_x, offset_y), special_flags=pygame.BLEND_ADD)
+    return True
+
+
 _STATIC_LAYER: dict = {}  # (track, view) -> the drawn scenery, see static_layer()
 
 
@@ -185,13 +231,13 @@ def draw_track(surface, track: Track, view: View, font, hovered, gates_passed: i
     # Drawn wall to wall rather than node to node, so it meets the tarmac edge.
     span = [view.to_screen(*p) for p in track.line_span(track.line)]
     pygame.draw.line(surface, LINE_MARK_COLOR, *span, width=max(1, int(2 * view.zoom)))
-    # The slots have to out-read the line they sit on, or the line looks like one
-    # solid bar and every node under it looks selectable.
+    # Slots sit on the line, so they get a dark rim rather than a dark halo — a
+    # filled halo on neighbouring slots rubs out the line running between them.
     for node in track.line_nodes():
         centre = view.node_screen(node)
         radius = max(4.0, SLOT_RADIUS * view.zoom)
-        pygame.draw.circle(surface, BACKGROUND, centre, radius + 2)
         pygame.draw.circle(surface, LINE_MARK_COLOR, centre, radius)
+        pygame.draw.circle(surface, BACKGROUND, centre, radius, width=1)
 
 
 def draw_markers(surface, track: Track, view: View, font) -> None:
@@ -279,12 +325,25 @@ def draw_path_button(surface, font, showing: bool) -> pygame.Rect:
 
 
 def draw_draw_button(surface, font) -> pygame.Rect:
-    """Third button: opens the track editor."""
+    """Third button: reads the circuit off the scanned drawing."""
     button = pygame.Rect(surface.get_width() - 186, 84, 172, 32)
     hovered = button.collidepoint(pygame.mouse.get_pos())
     pygame.draw.rect(surface, START_COLOR if hovered else BACKGROUND, button, border_radius=6)
     pygame.draw.rect(surface, START_COLOR, button, width=1, border_radius=6)
-    label = font.render("DRAW A MAP  (E)", True, BACKGROUND if hovered else START_COLOR)
+    label = font.render("READ SKETCH  (E)", True, BACKGROUND if hovered else START_COLOR)
+    surface.blit(label, label.get_rect(center=button.center))
+    return button
+
+
+def draw_sketch_button(surface, font, showing: bool, available: bool) -> pygame.Rect:
+    """Fourth button: lays the original drawing over the track."""
+    button = pygame.Rect(surface.get_width() - 186, 122, 172, 32)
+    colour = LINE_MARK_COLOR if available else (70, 76, 92)
+    hovered = available and button.collidepoint(pygame.mouse.get_pos())
+    pygame.draw.rect(surface, colour if showing or hovered else BACKGROUND, button, border_radius=6)
+    pygame.draw.rect(surface, colour, button, width=1, border_radius=6)
+    text = "HIDE SKETCH  (O)" if showing else "SHOW SKETCH  (O)"
+    label = font.render(text, True, BACKGROUND if (showing or hovered) else colour)
     surface.blit(label, label.get_rect(center=button.center))
     return button
 
@@ -317,7 +376,9 @@ def main() -> None:
     map_button = pygame.Rect(0, 0, 0, 0)
     path_button = pygame.Rect(0, 0, 0, 0)
     draw_button = pygame.Rect(0, 0, 0, 0)
-    drawing_board = None  # an editor.Editor while a circuit is being drawn
+    sketch_button = pygame.Rect(0, 0, 0, 0)
+    reading = ""  # what the last read of the drawing had to say
+    sketch_fade = 0  # index into SKETCH_FADES: the drawing laid over the track
     show_path = False
     solutions: dict[int, solver.Solution | None] = {}  # None means no way round
     solving: set[int] = set()
@@ -335,8 +396,22 @@ def main() -> None:
         # A new circuit means a new answer; show it only when it is asked for.
         show_path = False
 
+    def read_drawing() -> None:
+        """Read the circuit off the scan, save it and drive it."""
+        nonlocal reading
+        try:
+            drawing = detect.read(SKETCH)
+            ruling = detect.ruling(SKETCH)
+        except (ValueError, ImportError) as problem:
+            reading = f"could not read {SKETCH}: {problem}"
+            return
+        grid = tracks.grid_for(drawing.size, ruling)
+        tracks.save("SPA", drawing, grid, tracks.placement(ruling, grid), sketch=SKETCH)
+        adopt(tracks.build(tracks.load_all()[0]))
+        reading = ""
+
     def adopt(drawn) -> None:
-        """Switch to a circuit that has just been drawn and saved."""
+        """Switch to a circuit that has just been read from a drawing."""
         nonlocal track, variant, grid, view, show_path
         track = drawn
         # It was written to tracks/, so it is now first in the rotation.
@@ -371,17 +446,6 @@ def main() -> None:
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
-            elif drawing_board is not None:
-                # While the editor is up it owns the mouse and keyboard, bar the
-                # two keys that leave it.
-                if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
-                    drawing_board = None
-                else:
-                    drawing_board.handle(event)
-                    if drawing_board.built is not None:
-                        adopt(drawing_board.built)
-                        drawing_board = None
-                continue
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_ESCAPE:
                     running = False
@@ -394,7 +458,9 @@ def main() -> None:
                 elif event.key == pygame.K_p:
                     show_path = not show_path
                 elif event.key == pygame.K_e:
-                    drawing_board = editor.Editor(SKETCH, View, WINDOW_SIZE)
+                    read_drawing()
+                elif event.key == pygame.K_o:
+                    sketch_fade = (sketch_fade + 1) % len(SKETCH_FADES)
                 elif event.key == pygame.K_BACKSPACE:
                     car.undo()
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
@@ -409,7 +475,9 @@ def main() -> None:
                 elif path_button.collidepoint(event.pos):
                     show_path = not show_path
                 elif draw_button.collidepoint(event.pos):
-                    drawing_board = editor.Editor(SKETCH, View, WINDOW_SIZE)
+                    read_drawing()
+                elif sketch_button.collidepoint(event.pos):
+                    sketch_fade = (sketch_fade + 1) % len(SKETCH_FADES)
                 elif blocked and restart_button.collidepoint(event.pos):
                     car.reset(track.start)
                 # Before the first move the line places the car; once the car is
@@ -426,12 +494,6 @@ def main() -> None:
             elif event.type == pygame.MOUSEWHEEL:
                 view.zoom_at(*pygame.mouse.get_pos(), 1.1**event.y)
 
-        if drawing_board is not None:
-            drawing_board.draw(screen, font)
-            pygame.display.flip()
-            clock.tick(60)
-            continue
-
         keys = pygame.key.get_pressed()
         pan_speed = 400 * clock.get_time() / 1000
         view.pan(
@@ -444,6 +506,7 @@ def main() -> None:
         solution = solutions.get(variant)
 
         draw_track(screen, track, view, font, hovered, gates_passed)  # paints the background too
+        has_sketch = draw_sketch(screen, track, view, SKETCH_FADES[sketch_fade])
         if show_path and solution is not None:
             draw_path(screen, solution, view)  # under the car, so it never hides live state
         draw_markers(screen, track, view, font)
@@ -468,9 +531,12 @@ def main() -> None:
                 note, colour = f"best possible: {solution.turns} turns", PATH_COLOR
             screen.blit(font.render(note, True, colour), (14, 34))
 
+        if reading:
+            screen.blit(font.render(reading, True, CRASH_COLOR), (14, 56))
         map_button = draw_map_button(screen, font, track.name)
         path_button = draw_path_button(screen, font, show_path)
         draw_button = draw_draw_button(screen, font)
+        sketch_button = draw_sketch_button(screen, font, SKETCH_FADES[sketch_fade] > 0, has_sketch)
 
         if crashed:
             restart_button = draw_banner(screen, font, big_font, "CRASHED", CRASH_COLOR)

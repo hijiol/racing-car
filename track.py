@@ -77,12 +77,25 @@ class Boundary:
     outer: tuple[Point, ...]
     holes: tuple[tuple[Point, ...], ...] = ()
     walls: tuple = field(default=(), repr=False, compare=False)  # filled in below
+    _index: tuple = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         # Every wall segment, outer and holes alike, built once up front: this
         # list is walked for every legality check in the game.
         walls = tuple((ring[i - 1], ring[i]) for ring in (self.outer, *self.holes) for i in range(len(ring)))
         object.__setattr__(self, "walls", walls)
+        object.__setattr__(self, "_index", _bucket(walls))
+
+    def near(self, p: Point, q: Point):
+        """Wall segments that could possibly be near the hop p -> q."""
+        buckets, size = self._index
+        lo_x, hi_x = sorted((p[0], q[0]))
+        lo_y, hi_y = sorted((p[1], q[1]))
+        found = set()
+        for bx in range(int(lo_x // size), int(hi_x // size) + 1):
+            for by in range(int(lo_y // size), int(hi_y // size) + 1):
+                found.update(buckets.get((bx, by), ()))
+        return found
 
     def contains_point(self, point: Point) -> bool:
         if not point_in_polygon(point, self.outer):
@@ -98,7 +111,7 @@ class Boundary:
         """
         lo_x, hi_x = (p[0], q[0]) if p[0] <= q[0] else (q[0], p[0])
         lo_y, hi_y = (p[1], q[1]) if p[1] <= q[1] else (q[1], p[1])
-        for a, b in self.walls:
+        for a, b in self.near(p, q):
             if max(a[0], b[0]) < lo_x or min(a[0], b[0]) > hi_x:
                 continue
             if max(a[1], b[1]) < lo_y or min(a[1], b[1]) > hi_y:
@@ -106,6 +119,25 @@ class Boundary:
             if segments_cross(p, q, a, b):
                 return True
         return False
+
+
+BUCKET_SIZE = 40.0  # world units per bucket in the wall index
+
+
+def _bucket(walls):
+    """Sort wall segments into a coarse grid, so a hop only tests nearby ones.
+
+    A drawn circuit has a couple of thousand wall segments and a hop is a few
+    cells long, so all but a handful are irrelevant to any given move. Without
+    this the legality check walks every wall in the track, every time.
+    """
+    buckets: dict = {}
+    for wall in walls:
+        (ax, ay), (bx, by) = wall
+        for bxi in range(int(min(ax, bx) // BUCKET_SIZE), int(max(ax, bx) // BUCKET_SIZE) + 1):
+            for byi in range(int(min(ay, by) // BUCKET_SIZE), int(max(ay, by) // BUCKET_SIZE) + 1):
+                buckets.setdefault((bxi, byi), []).append(wall)
+    return {key: tuple(value) for key, value in buckets.items()}, BUCKET_SIZE
 
 
 def normal_at(centerline, i: int) -> Point:
@@ -249,6 +281,8 @@ class Track:
     line: Line  # the start/finish line: one line, as a real circuit has
     checkpoints: tuple[Line, ...] = ()  # gates that must be crossed in order
     name: str = ""  # what the map button calls it
+    sketch: str = ""  # the drawing this was read from, if any
+    sketch_place: tuple = ()  # (x, y, y_scale) putting that drawing back on the track
     start: Node = field(default=None)
 
     def __post_init__(self) -> None:
